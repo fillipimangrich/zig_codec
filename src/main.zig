@@ -8,153 +8,14 @@ const quant = @import("quantization.zig");
 const pred = @import("prediction.zig");
 const bitstream = @import("bitstream.zig");
 const io = @import("io.zig");
+const core = @import("core.zig");
 
 const BLOCK_SIZE = types.BLOCK_SIZE;
 
-// Helper para criar uma "visualização" de um plano específico como se fosse um Frame independente.
-fn make_plane_view(original: *types.Frame, plane: enum { Y, U, V }) types.Frame {
-    switch (plane) {
-        .Y => return types.Frame{
-            .width = original.width,
-            .height = original.height,
-            .y = original.y,
-            .u = undefined,
-            .v = undefined,
-            .allocator = original.allocator,
-        },
-        .U => return types.Frame{
-            .width = original.width / 2,
-            .height = original.height / 2,
-            .y = original.u,
-            .u = undefined,
-            .v = undefined,
-            .allocator = original.allocator,
-        },
-        .V => return types.Frame{
-            .width = original.width / 2,
-            .height = original.height / 2,
-            .y = original.v,
-            .u = undefined,
-            .v = undefined,
-            .allocator = original.allocator,
-        },
-    }
-}
-
-fn encode_plane(
-    bw: *bitstream.BitWriter,
-    curr_view: *const types.Frame,
-    ref_view: *const types.Frame,
-    recon_view: *types.Frame,
-    is_intra: bool,
-) !void {
-    var blk_orig: [BLOCK_SIZE * BLOCK_SIZE]u8 = undefined;
-    var blk_pred: [BLOCK_SIZE * BLOCK_SIZE]u8 = undefined;
-    var blk_resid: [BLOCK_SIZE * BLOCK_SIZE]f32 = undefined;
-    var blk_coeffs: [BLOCK_SIZE * BLOCK_SIZE]f32 = undefined;
-    var blk_quant: [BLOCK_SIZE * BLOCK_SIZE]i16 = undefined;
-    var blk_recon_resid: [BLOCK_SIZE * BLOCK_SIZE]f32 = undefined;
-
-    var by: usize = 0;
-    while (by < curr_view.height) : (by += BLOCK_SIZE) {
-        var bx: usize = 0;
-        while (bx < curr_view.width) : (bx += BLOCK_SIZE) {
-
-            // 1. Extrair Bloco Original
-            for (0..BLOCK_SIZE) |y| {
-                for (0..BLOCK_SIZE) |x| {
-                    blk_orig[y * BLOCK_SIZE + x] = curr_view.y[(by + y) * curr_view.width + (bx + x)];
-                }
-            }
-
-            // 2. Predição
-            if (is_intra) {
-                pred.intra_dc(bx, by, recon_view, &blk_pred);
-            } else {
-                const mv = pred.inter_motion_est(&blk_orig, bx, by, ref_view, &blk_pred);
-                try bw.writeSigned(@as(i16, mv.x));
-                try bw.writeSigned(@as(i16, mv.y));
-            }
-
-            // 3. Resíduo
-            for (0..blk_orig.len) |i| {
-                blk_resid[i] = @as(f32, @floatFromInt(blk_orig[i])) - @as(f32, @floatFromInt(blk_pred[i]));
-            }
-
-            // 4. Transformada & Quantização
-            transform.forward_dct(&blk_resid, &blk_coeffs);
-            quant.quantize(&blk_coeffs, &blk_quant);
-
-            // 5. Entropia
-            for (blk_quant) |q| {
-                try bw.writeSigned(q);
-            }
-
-            // --- Reconstrução ---
-            quant.dequantize(&blk_quant, &blk_coeffs);
-            transform.inverse_dct(&blk_coeffs, &blk_recon_resid);
-
-            for (0..BLOCK_SIZE) |y| {
-                for (0..BLOCK_SIZE) |x| {
-                    const idx = y * BLOCK_SIZE + x;
-                    const pred_val = @as(f32, @floatFromInt(blk_pred[idx]));
-                    const recon_val = std.math.clamp(pred_val + blk_recon_resid[idx], 0.0, 255.0);
-
-                    recon_view.y[(by + y) * curr_view.width + (bx + x)] = @as(u8, @intFromFloat(recon_val));
-                }
-            }
-        }
-    }
-}
-
-fn decode_plane(
-    br: *bitstream.BitReader,
-    ref_view: *const types.Frame,
-    curr_view: *types.Frame,
-    is_intra: bool,
-) !void {
-    var blk_pred: [BLOCK_SIZE * BLOCK_SIZE]u8 = undefined;
-    var blk_coeffs: [BLOCK_SIZE * BLOCK_SIZE]f32 = undefined;
-    var blk_quant: [BLOCK_SIZE * BLOCK_SIZE]i16 = undefined;
-    var blk_recon_resid: [BLOCK_SIZE * BLOCK_SIZE]f32 = undefined;
-
-    var by: usize = 0;
-    while (by < curr_view.height) : (by += BLOCK_SIZE) {
-        var bx: usize = 0;
-        while (bx < curr_view.width) : (bx += BLOCK_SIZE) {
-
-            // 1. Predição
-            if (is_intra) {
-                pred.intra_dc(bx, by, curr_view, &blk_pred);
-            } else {
-                const mv_x = try br.readSigned();
-                const mv_y = try br.readSigned();
-                pred.inter_motion_comp(bx, by, @as(i8, @intCast(mv_x)), @as(i8, @intCast(mv_y)), ref_view, &blk_pred);
-            }
-
-            // 2. Coeficientes
-            for (0..BLOCK_SIZE * BLOCK_SIZE) |i| {
-                blk_quant[i] = try br.readSigned();
-            }
-            quant.dequantize(&blk_quant, &blk_coeffs);
-
-            // 3. IDCT
-            transform.inverse_dct(&blk_coeffs, &blk_recon_resid);
-
-            // 4. Reconstrução
-            for (0..BLOCK_SIZE) |y| {
-                for (0..BLOCK_SIZE) |x| {
-                    const idx = y * BLOCK_SIZE + x;
-                    const pred_val = @as(f32, @floatFromInt(blk_pred[idx]));
-                    const recon_val = std.math.clamp(pred_val + blk_recon_resid[idx], 0.0, 255.0);
-
-                    curr_view.y[(by + y) * curr_view.width + (bx + x)] = @as(u8, @intFromFloat(recon_val));
-                }
-            }
-        }
-    }
-}
-
+// Função principal de codificação.
+// Main encoding function.
+// Lê um arquivo Y4M, comprime e escreve em um arquivo binário customizado.
+// Reads a Y4M file, compresses it, and writes to a custom binary file.
 fn encode(allocator: std.mem.Allocator, input_path: []const u8, output_path: []const u8) !void {
     const file = try fs.cwd().openFile(input_path, .{});
     defer file.close();
@@ -162,6 +23,8 @@ fn encode(allocator: std.mem.Allocator, input_path: []const u8, output_path: []c
     var buffered = std.io.bufferedReader(file.reader());
     const reader = buffered.reader();
 
+    // Lê o cabeçalho Y4M para saber a resolução.
+    // Reads the Y4M header to get the resolution.
     const header = try io.readY4mHeader(reader);
     std.debug.print("Encoding: {d}x{d}\n", .{ header.width, header.height });
 
@@ -170,56 +33,78 @@ fn encode(allocator: std.mem.Allocator, input_path: []const u8, output_path: []c
     var bw = bitstream.BitWriter.init(allocator);
     defer bw.deinit();
 
-    // Header Binário
+    // --- Header Binário / Binary Header ---
+    // Escrevemos a largura e altura (16 bits cada) no início do arquivo.
+    // We write the width and height (16 bits each) at the beginning of the file.
     try bw.writeBits(@as(u32, @intCast(header.width)), 16);
     try bw.writeBits(@as(u32, @intCast(header.height)), 16);
 
+    // Aloca frames para o processo de codificação.
+    // Allocates frames for the encoding process.
+    // curr_raw_frame: O frame que acabamos de ler do arquivo (entrada).
+    // curr_raw_frame: The frame we just read from the file (input).
     var curr_raw_frame = try types.Frame.init(allocator, header.width, header.height);
     defer curr_raw_frame.deinit();
+    // recon_frame: O frame reconstruído após a compressão (o que o decoder vai ver).
+    // recon_frame: The reconstructed frame after compression (what the decoder will see).
     var recon_frame = try types.Frame.init(allocator, header.width, header.height);
     defer recon_frame.deinit();
+    // ref_frame: O frame anterior reconstruído, usado como referência para predição Inter.
+    // ref_frame: The previous reconstructed frame, used as reference for Inter prediction.
     var ref_frame = try types.Frame.init(allocator, header.width, header.height);
     defer ref_frame.deinit();
 
+    // Inicializa o frame de referência com cinza (128) para o primeiro frame.
+    // Initializes the reference frame with gray (128) for the first frame.
     @memset(ref_frame.y, 128);
     @memset(ref_frame.u, 128);
     @memset(ref_frame.v, 128);
 
     var frame_idx: usize = 0;
 
+    // Loop principal: lê frame a frame até acabar o arquivo.
+    // Main loop: reads frame by frame until end of file.
     while (try io.readFrame(reader, &curr_raw_frame)) {
         std.debug.print("Encoding Frame {d}...\r", .{frame_idx});
 
-        // CORREÇÃO: Escreve flag '1' para indicar que existe um frame.
+        // Flag '1' indica que existe mais um frame.
+        // Flag '1' indicates there is another frame.
         try bw.writeBit(1);
 
+        // O primeiro frame é sempre Intra (I-Frame). Os outros são Inter (P-Frames).
+        // The first frame is always Intra (I-Frame). The others are Inter (P-Frames).
         const is_intra = (frame_idx == 0);
         try bw.writeBit(if (is_intra) 1 else 0);
 
-        // Y
-        var raw_y = make_plane_view(&curr_raw_frame, .Y);
-        var ref_y = make_plane_view(&ref_frame, .Y);
-        var recon_y = make_plane_view(&recon_frame, .Y);
-        try encode_plane(&bw, &raw_y, &ref_y, &recon_y, is_intra);
+        // Codifica cada plano separadamente.
+        // Encodes each plane separately.
 
-        // U
-        var raw_u = make_plane_view(&curr_raw_frame, .U);
-        var ref_u = make_plane_view(&ref_frame, .U);
-        var recon_u = make_plane_view(&recon_frame, .U);
-        try encode_plane(&bw, &raw_u, &ref_u, &recon_u, is_intra);
+        // Y (Luminância)
+        var raw_y = core.make_plane_view(&curr_raw_frame, .Y);
+        var ref_y = core.make_plane_view(&ref_frame, .Y);
+        var recon_y = core.make_plane_view(&recon_frame, .Y);
+        try core.encode_plane(&bw, &raw_y, &ref_y, &recon_y, is_intra);
 
-        // V
-        var raw_v = make_plane_view(&curr_raw_frame, .V);
-        var ref_v = make_plane_view(&ref_frame, .V);
-        var recon_v = make_plane_view(&recon_frame, .V);
-        try encode_plane(&bw, &raw_v, &ref_v, &recon_v, is_intra);
+        // U (Crominância)
+        var raw_u = core.make_plane_view(&curr_raw_frame, .U);
+        var ref_u = core.make_plane_view(&ref_frame, .U);
+        var recon_u = core.make_plane_view(&recon_frame, .U);
+        try core.encode_plane(&bw, &raw_u, &ref_u, &recon_u, is_intra);
 
+        // V (Crominância)
+        var raw_v = core.make_plane_view(&curr_raw_frame, .V);
+        var ref_v = core.make_plane_view(&ref_frame, .V);
+        var recon_v = core.make_plane_view(&recon_frame, .V);
+        try core.encode_plane(&bw, &raw_v, &ref_v, &recon_v, is_intra);
+
+        // Atualiza a referência: o frame reconstruído atual vira a referência para o próximo.
+        // Updates reference: the current reconstructed frame becomes the reference for the next one.
         ref_frame.copyFrom(recon_frame);
         frame_idx += 1;
     }
 
-    // CORREÇÃO: Escreve flag '0' para indicar fim do stream antes do flush.
-    // O decoder lerá esse 0 e saberá que acabou, ignorando o padding.
+    // Flag '0' indica fim do stream.
+    // Flag '0' indicates end of stream.
     try bw.writeBit(0);
 
     try bw.flush();
@@ -227,15 +112,23 @@ fn encode(allocator: std.mem.Allocator, input_path: []const u8, output_path: []c
     std.debug.print("\nEncoding Complete. Size: {d} bytes\n", .{bw.buffer.items.len});
 }
 
+// Função principal de decodificação.
+// Main decoding function.
+// Lê o arquivo binário comprimido e reconstrói o vídeo em formato Y4M.
+// Reads the compressed binary file and reconstructs the video in Y4M format.
 fn decode(allocator: std.mem.Allocator, input_path: []const u8, output_path: []const u8) !void {
     const file = try fs.cwd().openFile(input_path, .{});
     defer file.close();
 
+    // Lê o arquivo inteiro para a memória (simples, mas consome RAM).
+    // Reads the entire file into memory (simple, but consumes RAM).
     const file_data = try file.readToEndAlloc(allocator, 100 * 1024 * 1024);
     defer allocator.free(file_data);
 
     var br = bitstream.BitReader.init(file_data);
 
+    // Lê o cabeçalho binário.
+    // Reads the binary header.
     const width = try br.readBits(16);
     const height = try br.readBits(16);
     std.debug.print("Decoding: {d}x{d}\n", .{ width, height });
@@ -244,6 +137,8 @@ fn decode(allocator: std.mem.Allocator, input_path: []const u8, output_path: []c
     defer out_file.close();
     var out_writer = out_file.writer();
 
+    // Escreve o cabeçalho Y4M no arquivo de saída.
+    // Writes the Y4M header to the output file.
     try out_writer.print("YUV4MPEG2 W{d} H{d} F30:1 Ip A1:1 C420\n", .{ width, height });
 
     var curr_frame = try types.Frame.init(allocator, width, height);
@@ -258,8 +153,8 @@ fn decode(allocator: std.mem.Allocator, input_path: []const u8, output_path: []c
     var frame_idx: usize = 0;
 
     while (true) {
-        // CORREÇÃO: Lê o flag de "Existe Frame?".
-        // Se ler 0, sai do loop limpo.
+        // Verifica se há mais frames (lê o flag '1' ou '0').
+        // Checks if there are more frames (reads flag '1' or '0').
         const has_frame_bit = br.readBit() catch |err| {
             if (err == error.EndOfStream) break;
             return err;
@@ -267,42 +162,56 @@ fn decode(allocator: std.mem.Allocator, input_path: []const u8, output_path: []c
 
         if (has_frame_bit == 0) {
             // Fim do stream lógico encontrado.
+            // Logical end of stream found.
             break;
         }
 
-        // Se chegou aqui, existe um frame. Agora lê se é Intra ou Inter.
+        // Lê o tipo do frame (Intra ou Inter).
+        // Reads frame type (Intra or Inter).
         const is_intra_bit = try br.readBit();
         const is_intra = (is_intra_bit == 1);
 
         std.debug.print("Decoding Frame {d} ({s})...\r", .{ frame_idx, if (is_intra) "I" else "P" });
 
+        // Decodifica cada plano.
+        // Decodes each plane.
+
         // Y
-        var ref_y = make_plane_view(&ref_frame, .Y);
-        var curr_y = make_plane_view(&curr_frame, .Y);
-        try decode_plane(&br, &ref_y, &curr_y, is_intra);
+        var ref_y = core.make_plane_view(&ref_frame, .Y);
+        var curr_y = core.make_plane_view(&curr_frame, .Y);
+        try core.decode_plane(&br, &ref_y, &curr_y, is_intra);
 
         // U
-        var ref_u = make_plane_view(&ref_frame, .U);
-        var curr_u = make_plane_view(&curr_frame, .U);
-        try decode_plane(&br, &ref_u, &curr_u, is_intra);
+        var ref_u = core.make_plane_view(&ref_frame, .U);
+        var curr_u = core.make_plane_view(&curr_frame, .U);
+        try core.decode_plane(&br, &ref_u, &curr_u, is_intra);
 
         // V
-        var ref_v = make_plane_view(&ref_frame, .V);
-        var curr_v = make_plane_view(&curr_frame, .V);
-        try decode_plane(&br, &ref_v, &curr_v, is_intra);
+        var ref_v = core.make_plane_view(&ref_frame, .V);
+        var curr_v = core.make_plane_view(&curr_frame, .V);
+        try core.decode_plane(&br, &ref_v, &curr_v, is_intra);
 
-        // Saída Y4M
+        // Escreve o frame decodificado no arquivo Y4M.
+        // Writes the decoded frame to the Y4M file.
         try out_writer.writeAll("FRAME\n");
         try out_writer.writeAll(curr_frame.y);
         try out_writer.writeAll(curr_frame.u);
         try out_writer.writeAll(curr_frame.v);
 
+        // Atualiza a referência.
+        // Updates reference.
         ref_frame.copyFrom(curr_frame);
         frame_idx += 1;
     }
     std.debug.print("\nDecoding Complete.\n", .{});
 }
 
+// Calcula o PSNR (Peak Signal-to-Noise Ratio).
+// Calculates PSNR (Peak Signal-to-Noise Ratio).
+// Compara o vídeo original com o decodificado para medir a qualidade.
+// Compares the original video with the decoded one to measure quality.
+// Quanto maior o PSNR, melhor a qualidade (menos distorção).
+// The higher the PSNR, the better the quality (less distortion).
 fn calculate_psnr(path_a: []const u8, path_b: []const u8) !void {
     const file_a = try fs.cwd().openFile(path_a, .{});
     defer file_a.close();
@@ -331,6 +240,8 @@ fn calculate_psnr(path_a: []const u8, path_b: []const u8) !void {
         if (!has_a or !has_b) break;
 
         var mse: f64 = 0.0;
+        // Calcula o Erro Quadrático Médio (MSE) apenas para o plano Y.
+        // Calculates Mean Squared Error (MSE) for Y plane only.
         for (frame_a.y, frame_b.y) |p_a, p_b| {
             const diff = @as(f64, @floatFromInt(p_a)) - @as(f64, @floatFromInt(p_b));
             mse += diff * diff;
@@ -341,6 +252,8 @@ fn calculate_psnr(path_a: []const u8, path_b: []const u8) !void {
     }
 
     const avg_mse = total_mse / @as(f64, @floatFromInt(frame_count));
+    // Fórmula do PSNR: 10 * log10(MAX^2 / MSE)
+    // PSNR Formula: 10 * log10(MAX^2 / MSE)
     const psnr = 10.0 * std.math.log10((255.0 * 255.0) / avg_mse);
     std.debug.print("Processed {d} frames. PSNR (Y only): {d:.2} dB\n", .{ frame_count, psnr });
 }
